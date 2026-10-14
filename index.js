@@ -8,9 +8,10 @@
  */
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { readFile, appendFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createInterface } from 'node:readline'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
@@ -47,6 +48,10 @@ const CONFIG_DOCUMENT_PATH = '/dsh-tether/config-document'
 /** 按需开一个配对窗口,拿回配对串 */
 const PAIRING_PATH = '/dsh-tether/pairing'
 const DEVICES_PATH = '/dsh-tether/devices'
+/** 连接状态(直连/中转);桌面 GUI 的状态展示用 */
+const STATUS_PATH = '/dsh-tether/status'
+/** 注入脚本的心跳回报;桌面端渲染器日志不可得,跑没跑看这条 */
+const UI_HEARTBEAT_PATH = '/dsh-tether/ui-heartbeat'
 
 /** dsh 的回环判定:localhost、IPv6 回环、以及整个 127/8 */
 function isLoopbackHostname(hostname) {
@@ -218,6 +223,12 @@ function apply(ctx, config = {}) {
   let pendingPairing
   /** 等着拿设备列表的那些请求;sidecar 回 devices 时一并兑现 */
   let pendingDevices = []
+  /**
+   * 每台已连接手机的最近一条 peer-path(直连/中转)。sidecar 的这些消息只打在
+   * 日志里,界面上谁都看不到;这里记下来,STATUS 路由拿去给桌面 GUI 展示。
+   * key 是 sidecar 报的手机名,与 devices 消息里的 name 一致。
+   */
+  const peerPaths = new Map()
 
   createInterface({ input: child.stdout }).on('line', (line) => {
     let msg
@@ -249,14 +260,17 @@ function apply(ctx, config = {}) {
         console.log(`[tether] ${tt('配对成功: ', 'paired: ')}${msg.name}(${msg.peer.slice(0, 16)}…)`)
         break
       case 'peer-connected':
+        peerPaths.set(msg.name, {})
         console.log(`[tether] ${tt('手机已连接: ', 'phone connected: ')}${msg.name}`)
         break
       case 'peer-path':
+        peerPaths.set(msg.name, { kind: msg.kind, remote: msg.remote })
         console.log(`[tether] ${msg.kind === 'direct'
           ? tt('连接路径: P2P 直连(NAT 打洞成功) ', 'path: direct P2P (NAT hole punch succeeded) ')
           : tt('连接路径: relay 中转(打洞未成,可用但延迟略高) ', 'path: via relay (hole punch failed; works, slightly higher latency) ')}${msg.remote}`)
         break
       case 'peer-disconnected':
+        peerPaths.delete(msg.name)
         console.log(`[tether] ${tt('手机已断开', 'phone disconnected')}`)
         break
       case 'proxy-opened':
@@ -384,6 +398,37 @@ function apply(ctx, config = {}) {
       }
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
       res.end(JSON.stringify({ devices }))
+    },
+  }))
+
+  // 连接状态。devices 路由只有在线与否,「直连还是中转」此前只存在于 sidecar
+  // 日志;这里把经过 stdout 的 peer-* 消息聚合成一份,GUI 的状态展示用它。
+  // 不带 sidecar 往返,sidecarGone 直接写在应答里,调用方自己渲染。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: STATUS_PATH,
+    handler: async (req, res) => {
+      if (!isTrustedRequest(req)) return refuse(res)
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(JSON.stringify({
+        endpointId,
+        sidecarGone: sidecarGone ?? null,
+        peers: [...peerPaths].map(([name, path]) => ({ name, ...path })),
+      }))
+    },
+  }))
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: UI_HEARTBEAT_PATH,
+    handler: async (req, res) => {
+      if (!isTrustedRequest(req)) return refuse(res)
+      // 桌面端渲染器的控制台日志拿不到,注入脚本跑没跑、DOM 前置在不在,
+      // 由脚本自己打这条回报落盘看。仅排障用途,无敏感数据。
+      const line = `${new Date().toISOString()} ${req.url?.split('?')[1] ?? ''}\n`
+      await appendFile(join(tmpdir(), 'dsh-tether-ui.log'), line).catch(() => {})
+      res.writeHead(204)
+      res.end()
     },
   }))
 
@@ -674,7 +719,11 @@ const tetherScript = `
     var list = document.createElement('div')
     box.append(head, list)
 
-    function render(devices) {
+    // 移除设备后重渲染只回传 devices,路径沿用上次那份
+    var lastPaths = null
+    function render(devices, paths) {
+      if (paths === undefined) paths = lastPaths
+      lastPaths = paths
       list.textContent = ''
       if (!devices.length) {
         var none = document.createElement('div')
@@ -698,6 +747,17 @@ const tetherScript = `
           + ';font-family:ui-monospace,"SF Mono",Consolas,monospace;padding-left:8px'
         idTag.textContent = d.id.slice(0, 8)
         label.append(idTag)
+        // 直连/中转只看 STATUS 路由(peer-path 只打到 sidecar 日志里);
+        // 路径还没探明(kind 未上报)时不画,不拿"未知"充数。
+        var path = paths && paths[d.name]
+        if (path && path.kind) {
+          var pathTag = document.createElement('span')
+          pathTag.style.cssText = 'font-size:12px;color:' + t.muted + ';padding-left:8px'
+          pathTag.textContent = path.kind === 'direct'
+            ? tx('P2P 直连', 'P2P direct')
+            : tx('中转', 'relay')
+          label.append(pathTag)
+        }
         // 不用原生 confirm:第一下改文案,第二下才真删
         var drop = document.createElement('button')
         drop.textContent = tx('移除', 'Remove')
@@ -740,9 +800,22 @@ const tetherScript = `
     loading.style.cssText = 'font-size:12px;color:' + t.muted
     loading.textContent = tx('读取中…', 'Loading…')
     list.append(loading)
-    fetch('${DEVICES_PATH}', { headers: langHeaders() })
-      .then(function (r) { return r.ok ? r.json() : r.text().then(function (x) { throw new Error(x) }) })
-      .then(function (x) { render(x.devices) })
+    // 设备列表与连接状态各拉一份,齐了一起渲染;状态路由挂了不拖垮列表。
+    Promise.all([
+      fetch('${DEVICES_PATH}', { headers: langHeaders() })
+        .then(function (r) { return r.ok ? r.json() : r.text().then(function (x) { throw new Error(x) }) }),
+      fetch('${STATUS_PATH}', { headers: langHeaders() })
+        .then(function (r) { return r.ok ? r.json() : null })
+        .catch(function () { return null }),
+    ])
+      .then(function (x) {
+        var paths = null
+        if (x[1] && x[1].peers) {
+          paths = {}
+          x[1].peers.forEach(function (p) { paths[p.name] = p })
+        }
+        render(x[0].devices, paths)
+      })
       .catch(function (e) { loading.textContent = tx('读取失败: ', 'Loading failed: ') + (e && e.message ? e.message : e) })
     return box
   }
@@ -885,6 +958,41 @@ const tetherScript = `
   }
   mountHostsTrigger()
   new MutationObserver(mountHostsTrigger).observe(document.documentElement, { childList: true, subtree: true })
+
+  // 排障锚点:桌面端(dsh-desktop)与浏览器哪一步断了,看这一条控制台日志就知道 —
+  // 「没有这行」= 注入没执行;「slot: false」= 侧栏 DOM 结构变了;
+  // 「mounted: false」= 按钮没挂上。控制台日志在 Electron 里拿不到,同时往宿主
+  // 打一条心跳落盘。附上本按钮与账号行的盒、以及账号行的计算样式——桌面端的几何
+  // 一旦变样,这条日志里就有对照,不用再靠肉眼估。
+  setTimeout(function () {
+    var btnEl = document.querySelector('[data-dsh-tether="hosts-trigger"]')
+    var labelEl = document.querySelector('[data-dsh-tether="hosts-label"]')
+    var slotEl = document.querySelector('[data-slot="sidebar.footer.action"]')
+    var settingsEl = document.querySelector('[data-slot="settings.trigger"]')
+    var area = slotEl && slotEl.parentElement && slotEl.parentElement.nextElementSibling
+    var accountEl = area ? area.querySelector('button') : null
+    var rect = function (el) {
+      if (!el) return 'none'
+      var b = el.getBoundingClientRect()
+      return [b.left, b.top, b.width, b.height].map(function (n) { return Math.round(n) }).join(',')
+    }
+    var box = function (el) {
+      if (!el) return 'none'
+      var s = getComputedStyle(el)
+      return [s.height, s.paddingLeft, s.paddingTop, s.fontSize, s.borderRadius].join('/')
+    }
+    var mounted = !!btnEl
+    var hasSlot = !!slotEl
+    var hasSettings = !!settingsEl
+    var labelvis = labelEl ? getComputedStyle(labelEl).display : 'none'
+    var collapsed = !!document.querySelector('[data-sidebar-collapsed]')
+    console.log('[dsh-tether] ui mounted:', mounted, '| slot:', hasSlot, '| settings:', hasSettings)
+    fetch('${UI_HEARTBEAT_PATH}?mounted=' + mounted + '&slot=' + hasSlot + '&settings=' + hasSettings
+      + '&labelvis=' + labelvis + '&framed=' + framed + '&collapsed=' + collapsed
+      + '&btn=' + rect(btnEl) + '&btnbox=' + box(btnEl)
+      + '&acct=' + rect(accountEl) + '&acctbox=' + box(accountEl))
+      .catch(function () {})
+  }, 5000)
 
   document.addEventListener('click', function (event) {
     if (!narrow.matches) return
